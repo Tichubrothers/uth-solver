@@ -216,7 +216,7 @@
           <br><br>
           Known dealer cards are used directly. If one dealer card is known, only the second card is enumerated/simulated. Other players' cards are treated as dead cards and removed from the deck; they are not competing hands.
           <br><br>
-          Exact EV is used when the board has 3, 4, or 5 cards, subject to the exact enumeration limit. Pre-flop has billions of possible outcomes, so the action uses the common optimal/basic 4x chart and the odds display uses simulation.
+          Exact EV is used when the board has 3, 4, or 5 cards, subject to the exact enumeration limit. Pre-flop has billions of possible outcomes, so the action is chosen by comparing simulated EV for Raise 4x, Raise 3x, and Check. Known dealer/dead cards and custom Blind payouts are included in those pre-flop EV estimates.
         </div>
       </details>
     </section>
@@ -468,7 +468,7 @@
 
   function blankStats(method) {
     return {
-      method, samples:0, evSum:0, wins:0, losses:0, ties:0, dealerOpens:0,
+      method, samples:0, evSum:0, evSqSum:0, wins:0, losses:0, ties:0, dealerOpens:0,
       handCats: Object.fromEntries(DIST_ORDER.map(n => [n, 0]))
     };
   }
@@ -476,6 +476,7 @@
   function record(stats, outcome, playerEval) {
     stats.samples++;
     stats.evSum += outcome.profit;
+    stats.evSqSum += outcome.profit * outcome.profit;
     if (outcome.cmp > 0) stats.wins++;
     else if (outcome.cmp < 0) stats.losses++;
     else stats.ties++;
@@ -485,6 +486,13 @@
 
   function finalize(stats) {
     stats.ev = stats.samples ? stats.evSum / stats.samples : NaN;
+    if (stats.samples > 1) {
+      const meanSq = stats.evSqSum / stats.samples;
+      const variance = Math.max(0, meanSq - stats.ev * stats.ev);
+      stats.stderr = Math.sqrt(variance / stats.samples);
+    } else {
+      stats.stderr = NaN;
+    }
     return stats;
   }
 
@@ -606,6 +614,95 @@
     return {method:'Exact', ev: sum / count, samples: count, betCount, foldCount};
   }
 
+  function flopShouldRaise2(player, flop) {
+    const evalNow = evaluate7(player.concat(flop));
+    if (evalNow.cat >= 2) return true; // two pair or better
+
+    const pr = [cardRank(player[0]), cardRank(player[1])];
+    const fs = flop.map(cardSuit);
+    const fr = flop.map(cardRank);
+
+    // Hidden pair: pocket pair or a hole card paired by the board. Exclude pocket deuces.
+    if (pr[0] === pr[1]) return pr[0] !== 2;
+    if (fr.includes(pr[0]) || fr.includes(pr[1])) return true;
+
+    // Four-flush with a hidden Ten or better.
+    for (const s of SUITS) {
+      const suitedHole = player.filter(c => cardSuit(c) === s);
+      const count = fs.filter(x => x === s).length + suitedHole.length;
+      if (count >= 4 && suitedHole.some(c => cardRank(c) >= 10)) return true;
+    }
+    return false;
+  }
+
+  function riverShouldBetFast(player, board, knownDealer = [], dead = [], paytable = defaultPaytable) {
+    // Exact river EV is feasible for a single board and gives the right bet/fold threshold.
+    return exactBetEV(player, board, 1, knownDealer, dead, paytable).ev >= -2;
+  }
+
+  function monteCarloPreflopCheckEV(player, trials, knownDealer = [], dead = [], paytable = defaultPaytable) {
+    const stats = blankStats('Monte Carlo rollout');
+    stats.flopRaise2 = 0;
+    stats.riverBet1 = 0;
+    stats.riverFold = 0;
+
+    const rng = makeRng('preflop-check|' + player.join('') + '|d:' + knownDealer.join('') + '|x:' + dead.join('') + '|p:' + paytableKey(paytable) + '|n:' + trials);
+    const baseRem = remainingDeck(player.concat(knownDealer, dead));
+    const dealerMissing = 2 - knownDealer.length;
+    const riverDecisionCache = new Map();
+
+    for (let t = 0; t < trials; t++) {
+      const boardDraw = drawFromPool(baseRem, 5, rng);
+      const dealerDraw = drawFromPool(boardDraw.rest, dealerMissing, rng);
+      const board = boardDraw.drawn;
+      const flop = board.slice(0, 3);
+      const dealerCards = knownDealer.concat(dealerDraw.drawn);
+      const playerEval = evaluate7(player.concat(board));
+      const dealerEval = evaluate7(dealerCards.concat(board));
+
+      let outcome;
+      if (flopShouldRaise2(player, flop)) {
+        stats.flopRaise2++;
+        outcome = settle(playerEval, dealerEval, 2, paytable);
+      } else {
+        const key = handKey(player, board) + '|d:' + knownDealer.slice().sort().join('') + '|x:' + dead.slice().sort().join('') + '|p:' + paytableKey(paytable);
+        let betRiver = riverDecisionCache.get(key);
+        if (betRiver === undefined) {
+          betRiver = riverShouldBetFast(player, board, knownDealer, dead, paytable);
+          riverDecisionCache.set(key, betRiver);
+        }
+        if (betRiver) {
+          stats.riverBet1++;
+          outcome = settle(playerEval, dealerEval, 1, paytable);
+        } else {
+          stats.riverFold++;
+          outcome = {profit:-2, cmp:-1, dealerOpens: dealerEval.cat >= 1};
+        }
+      }
+      record(stats, outcome, playerEval);
+    }
+    return finalize(stats);
+  }
+
+  function chooseBestPreflopAction(raise4, raise3, check) {
+    const options = [
+      {action:'RAISE 4x', ev:raise4.ev, stats:raise4},
+      {action:'RAISE 3x', ev:raise3.ev, stats:raise3},
+      {action:'CHECK', ev:check.ev, stats:check}
+    ].sort((a, b) => b.ev - a.ev);
+    return {
+      rec: options[0].action,
+      best: options[0],
+      second: options[1],
+      margin: options[0].ev - options[1].ev,
+      options
+    };
+  }
+
+  function seText(stats) {
+    return Number.isFinite(stats.stderr) ? ` ± ${stats.stderr.toFixed(4)} SE` : '';
+  }
+
   function preflopChart(player) {
     const a = cardRank(player[0]), b = cardRank(player[1]);
     const suited = cardSuit(player[0]) === cardSuit(player[1]);
@@ -685,19 +782,26 @@
       const customNote = `<p class="note">${paytableSummary(paytable)}</p>`;
 
       if (b === 0) {
-        stage = 'Pre-flop decision';
-        rec = preflopChart(player);
+        stage = 'Pre-flop decision — EV-based';
+        const chartRec = preflopChart(player);
         const raise4 = monteCarloBetEV(player, board, 4, trials, dealer, dead, paytable);
-        const raise3 = monteCarloBetEV(player, board, 3, Math.max(5000, Math.floor(trials / 3)), dealer, dead, paytable);
-        evText = `Recommended by the pre-flop 4x chart. Immediate 4x EV estimate: <strong class="${raise4.ev >= 0 ? 'good' : 'bad'}">${fmtEV(raise4.ev)}</strong> per Ante.`;
+        const raise3 = monteCarloBetEV(player, board, 3, Math.max(5000, Math.floor(trials / 2)), dealer, dead, paytable);
+        const checkTrials = Math.max(5000, Math.min(12000, Math.floor(trials / 4)));
+        const check = monteCarloPreflopCheckEV(player, checkTrials, dealer, dead, paytable);
+        const decision = chooseBestPreflopAction(raise4, raise3, check);
+        rec = decision.rec; // IMPORTANT: headline uses EV comparison, not the basic chart
+        const bestClass = decision.best.ev >= 0 ? 'good' : 'bad';
+        const knownInfo = dealer.length || dead.length ? ' Known dealer/dead cards are included in every pre-flop EV estimate.' : '';
+        evText = `Best estimated pre-flop EV: <strong class="${bestClass}">${fmtEV(decision.best.ev)}</strong> per Ante. Margin over next best: <strong>${fmtEV(decision.margin)}</strong>.${knownInfo}`;
         bodyHtml = `
-          <p class="note"><strong>Pre-flop note:</strong> There are over two billion possible board/dealer completions from this point. This app uses the standard 4x raise chart for the action recommendation and Monte Carlo for the displayed odds. Known dealer/dead cards and custom Blind payouts are included in the Monte Carlo odds, but the pre-flop chart itself assumes ordinary UTH strategy.</p>
+          <p class="note"><strong>Pre-flop note:</strong> The recommendation is now chosen from the simulated EV of Raise 4x, Raise 3x, and Check. The Check line uses a rollout policy: raise 2x on common strong flop situations, otherwise continue to the river and make an exact 1x bet/fold decision for that final board. Because pre-flop has billions of possible completions, these numbers are estimates; increase trials for tighter results.</p>
+          <p class="note">Basic 4x chart reference only, not the headline action: <strong>${chartRec}</strong>. The chart does not adjust for known dead/dealer cards, but the EV recommendation above does.</p>
           ${customNote}
           <h2 style="padding-left:0">Action EV</h2>
           ${actionRows([
-            {action:'Raise 4x now', ev:raise4.ev, method:raise4.method + ` (${raise4.samples.toLocaleString()})`, note:'Recommended when the chart says raise.'},
-            {action:'Raise 3x now', ev:raise3.ev, method:raise3.method + ` (${raise3.samples.toLocaleString()})`, note:'Usually inferior to 4x when raising.'},
-            {action:'Check', ev:NaN, method:'Chart', note:'Exact check-line EV is not enumerated pre-flop in this browser app.'}
+            {action:'Raise 4x now', ev:raise4.ev, method:raise4.method + ` (${raise4.samples.toLocaleString()})`, note:`Forced 4x line${seText(raise4)}.`},
+            {action:'Raise 3x now', ev:raise3.ev, method:raise3.method + ` (${raise3.samples.toLocaleString()})`, note:`Forced 3x line${seText(raise3)}.`},
+            {action:'Check', ev:check.ev, method:check.method + ` (${check.samples.toLocaleString()})`, note:`Flop 2x ${fmtPct(check.flopRaise2 / check.samples)}, river bet ${fmtPct(check.riverBet1 / check.samples)}, fold ${fmtPct(check.riverFold / check.samples)}${seText(check)}.`}
           ])}
           <h2 style="padding-left:0; margin-top:18px">Showdown odds if you raise 4x now</h2>
           ${oddsTable(raise4)}
@@ -743,7 +847,7 @@
         stage = `${b}-card board, non-standard UTH decision point`;
         const mult = b < 3 ? 4 : 1;
         const ev = bestBetEV(player, board, mult, exactLimit, trials, dealer, dead, paytable);
-        rec = b < 3 ? preflopChart(player) : (ev.ev >= -2 ? `BET ${mult}x` : 'FOLD');
+        rec = b < 3 ? (ev.ev >= 0 ? `BET ${mult}x` : 'CHECK') : (ev.ev >= -2 ? `BET ${mult}x` : 'FOLD');
         evText = `This is not a normal Ultimate Texas Hold'em decision stage. Displayed EV uses a forced ${mult}x Play bet model: <strong class="${ev.ev >= 0 ? 'good' : 'bad'}">${fmtEV(ev.ev)}</strong>.`;
         bodyHtml = `
           <p class="note">Normal decision stages are 0, 3, and 5 board cards. I still calculated odds by completing the remaining board cards randomly/exactly depending on the enumeration size.</p>
